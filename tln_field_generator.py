@@ -1,6 +1,6 @@
 import os
 
-from typing import Dict, Tuple, Iterable, Generator, Optional, Literal, List
+from typing import Dict, Tuple, Iterable, Generator, Optional, Literal, List, Type
 import h5py
 import numpy as np
 import matplotlib.pyplot as plt
@@ -95,74 +95,6 @@ class TruncatedLog10LognormalFieldGenerator:
         self.truncated_dist = truncnorm(
             a=self.a_std, b=self.b_std, loc=self.mu10, scale=self.sigma10
         )
-
-    # -----------------------------------------------------------------
-    # Main generation method
-    # -----------------------------------------------------------------
-    def generate_field(
-        self,
-        grid_x: np.ndarray,
-        grid_y: np.ndarray,
-        *,
-        var_kernel: float = 1.0,
-        len_scale: float,
-        angles: float = 0.0,
-        anis: float = 1.0,
-        seed: int | None = None,
-        copula: Literal["gaussian", "t"] = "gaussian",
-        nu: float | None = 5,
-        standardize_latent: bool = True,
-    ) -> np.ndarray:
-        """
-        Generate a truncated base-10 lognormal field using the chosen copula.
-
-        Parameters
-        ----------
-        var_kernel : float
-            Variance of latent Gaussian field (spatial variability control).
-        len_scale, angles, anis : float
-            Covariance parameters for GSTools Exponential kernel.
-        seed : int | None
-            Random seed for reproducibility.
-        copula : {'gaussian', 't'}
-            Spatial dependence type.
-        nu : float | None
-            Degrees of freedom for t-copula.
-        standardize_latent : bool
-            If True, re-standardize Z to mean=0, var=1 before mapping.
-
-        Returns
-        -------
-        K : 2D ndarray, values in [a, b]
-        """
-        # 1) Latent Gaussian field
-        model = gs.Exponential(dim=2, var=var_kernel, len_scale=len_scale,
-                               angles=angles, anis=anis)
-        srf = gs.SRF(model, mean=0.0, seed=seed)
-        Z = srf.structured([grid_x, grid_y])  # Gaussian field
-
-        if standardize_latent:
-            Z = (Z - np.mean(Z)) / np.std(Z)
-
-        # 2) Map to uniform via copula
-        if copula == "gaussian":
-            U = norm.cdf(Z)
-        elif copula == "t":
-            if nu is None or nu <= 0:
-                raise ValueError("For copula='t', provide nu > 0.")
-            rng = np.random.default_rng(seed)
-            W = rng.chisquare(df=nu) / nu
-            T = Z / np.sqrt(W)
-            U = student_t.cdf(T, df=nu)
-        else:
-            raise ValueError("copula must be 'gaussian' or 't'.")
-
-        U = np.clip(U, 1e-12, 1 - 1e-12)  # numerical safety
-
-        # 3) Apply truncated-normal quantile and exponentiate
-        Y = self.truncated_dist.ppf(U)
-        K = np.power(10.0, Y)
-        return K
 
     def generate_ensemble(
         self,
@@ -365,92 +297,347 @@ class TruncatedLog10LognormalFieldGenerator:
 
         return paths
 
-def plot_field_diagnostics(K: np.ndarray, generator: TruncatedLog10LognormalFieldGenerator, *,
-                           figsize=(15,5), log_scale=True, title=None):
+def save_ensemble_diagnostics_single_page_pdf(
+    K_ens: np.ndarray,
+    generator,
+    pdf_path: str,
+    *,
+    log_scale: bool = True,
+    bins: int = 50,
+    cmap: str = "viridis",
+    titles: list[str] | None = None,
+    seeds: list[int] | None = None,
+    figsize: tuple[float, float] | None = None,
+    per_block_size: tuple[float, float] = (3.6, 2.8),
+    suptitle: str | None = None,
+    dpi: int = 300,
+) -> str:
     """
-    Visualize a generated permeability field and its marginal statistics.
+    Save a single-PAGE PDF showing, for each realization, the spatial map and histograms
+    (linear K and log10(K) with truncated-normal PDF overlay).
 
     Parameters
     ----------
-    K : np.ndarray
-        Generated permeability field (2D).
+    K_ens : ndarray
+        Shape (n_realizations, Ny, Nx).
     generator : TruncatedLog10LognormalFieldGenerator
-        The generator instance used (for access to a,b,mu10,sigma10,...).
-    figsize : tuple
-        Figure size.
+        Used for marginal params and color limits (a, b; mu10, sigma10; truncated_dist).
+    pdf_path : str
+        Output file path (.pdf).
     log_scale : bool
-        Whether to also plot log10(K) histogram.
-    title : str, optional
-        Title for the figure.
+        If True, include the log10(K) histogram with truncated-normal PDF overlay.
+    bins : int
+        Histogram bins.
+    cmap : str
+        Colormap for spatial plots.
+    titles : list[str], optional
+        Per-realization titles. If provided, overrides seeds-based titles.
+    seeds : list[int], optional
+        Per-realization seeds for titles, if desired.
+    figsize : (W, H) in inches, optional
+        Overall figure size. If None, computed from per_block_size and grid shape.
+    per_block_size : (w, h)
+        Size (inches) per realization row and per column set; used to auto-compute figsize.
+    suptitle : str, optional
+        Global title for the page.
+    dpi : int
+        Rendering DPI for the saved page.
+
+    Returns
+    -------
+    pdf_path : str
+        The written file path.
     """
+    if K_ens.ndim != 3:
+        raise ValueError("K_ens must have shape (n_realizations, Ny, Nx).")
+    n = K_ens.shape[0]
+    if titles is not None and len(titles) != n:
+        raise ValueError("len(titles) must equal number of realizations.")
+    if seeds is not None and len(seeds) != n:
+        raise ValueError("len(seeds) must equal number of realizations.")
+
+    # Columns: [spatial, hist(K), hist(log10 K) optional]
+    n_cols = 3 if log_scale else 2
+    n_rows = n
+
+    # Auto figure size if not provided
+    if figsize is None:
+        w_per_col, h_per_row = per_block_size
+        figsize = (w_per_col * n_cols, h_per_row * n_rows)
 
     a, b = generator.a, generator.b
     loga, logb = np.log10(a), np.log10(b)
     mu10, sigma10 = generator.mu10, generator.sigma10
 
-    # Flatten values
-    vals = K.flatten()
-    logvals = np.log10(vals)
+    # Precompute theoretical truncated-normal PDF on log10 scale (for overlay)
+    x_log = np.linspace(loga, logb, 200)
+    pdf_log = generator.truncated_dist.pdf(x_log)
 
-    # Compute empirical stats
-    emp_mean, emp_std = np.mean(logvals), np.std(logvals)
-    theo_mean, theo_var = truncnorm_moments(mu10, sigma10, loga, logb)
-    theo_std = np.sqrt(theo_var)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False)
+    im_last = None
 
-    # ---- Figure layout ----
-    fig, axes = plt.subplots(1, 3 if log_scale else 2, figsize=figsize)
-    if title:
-        fig.suptitle(title, fontsize=13)
+    for i in range(n_rows):
+        K = K_ens[i]
+        vals = K.ravel()
+        logvals = np.log10(vals)
 
-    # --- (1) Spatial field map ---
-    ax = axes[0]
-    im = ax.imshow(K, origin="lower", cmap="viridis",
-                   vmin=a, vmax=b, interpolation="nearest")
-    ax.set_title("Permeability Field K")
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="K")
-    ax.set_xlabel("x"); ax.set_ylabel("y")
+        # --- (1) Spatial map ---
+        ax0 = axes[i, 0]
+        im_last = ax0.imshow(
+            K, origin="lower", cmap=cmap, vmin=a, vmax=b, interpolation="nearest"
+        )
+        if titles is not None:
+            ax0.set_title(titles[i], fontsize=9)
+        elif seeds is not None:
+            ax0.set_title(f"Realization {i} (seed={seeds[i]})", fontsize=9)
+        else:
+            ax0.set_title(f"Realization {i}", fontsize=9)
+        ax0.set_xticks([]); ax0.set_yticks([])
 
-    # --- (2) Histogram of K ---
-    ax = axes[1]
-    ax.hist(vals, bins=50, color="steelblue", alpha=0.8, density=True)
-    ax.axvline(a, color="r", ls="--", lw=1)
-    ax.axvline(b, color="r", ls="--", lw=1)
-    ax.set_title("Histogram of K (linear)")
-    ax.set_xlabel("K"); ax.set_ylabel("Density")
+        # --- (2) Histogram of K (linear) ---
+        ax1 = axes[i, 1]
+        ax1.hist(vals, bins=bins, density=True, color="steelblue", alpha=0.8)
+        ax1.axvline(a, color="r", ls="--", lw=1)
+        ax1.axvline(b, color="r", ls="--", lw=1)
+        if i == n_rows - 1:
+            ax1.set_xlabel("K")
+        ax1.set_ylabel("Density" if i == 0 else "")
+        if i == 0:
+            ax1.set_title("Histogram of K (linear)", fontsize=9)
 
-    # --- (3) Histogram of log10(K) ---
-    if log_scale:
-        ax = axes[2]
-        ax.hist(logvals, bins=50, color="darkorange", alpha=0.8, density=True)
-        x = np.linspace(loga, logb, 200)
-        pdf = generator.truncated_dist.pdf(x)
-        ax.plot(x, pdf, "k--", lw=1.5, label="Truncated normal PDF")
-        ax.legend()
-        ax.set_xlabel("log10(K)")
-        ax.set_title("Histogram of log10(K)")
+        # --- (3) Histogram of log10(K) with PDF overlay ---
+        if log_scale:
+            ax2 = axes[i, 2]
+            ax2.hist(logvals, bins=bins, density=True, color="darkorange", alpha=0.8)
+            ax2.plot(x_log, pdf_log, "k--", lw=1.2, label="Trunc. normal PDF")
+            if i == 0:
+                ax2.legend(fontsize=8, frameon=False)
+                ax2.set_title("Histogram of log10(K)", fontsize=9)
+            if i == n_rows - 1:
+                ax2.set_xlabel("log10(K)")
 
-    # ---- Print numerical summary ----
-    print("\n--- Truncated log10(K) statistics ---")
-    print(f"Theoretical mean:     {theo_mean: .4f}")
-    print(f"Theoretical std:      {theo_std: .4f}")
-    print(f"Empirical mean:       {emp_mean: .4f}")
-    print(f"Empirical std:        {emp_std: .4f}")
-    print(f"Relative error (mean/std): "
-          f"{(emp_mean-theo_mean)/theo_mean:+.2%}, "
-          f"{(emp_std-theo_std)/theo_std:+.2%}")
-    print(f"Coverage within bounds [{a:.2e}, {b:.2e}]: "
-          f"{np.mean((vals>=a)&(vals<=b))*100:.2f}%")
+        # Optionally, you could annotate summary stats compactly on the right,
+        # but to keep the page readable for many realizations, we omit text here.
 
+    # Shared colorbar for all spatial maps (leftmost column)
+    if im_last is not None:
+        cax = fig.add_axes([0.92, 0.1, 0.015, 0.8])  # manual thin colorbar on the right
+        cbar = fig.colorbar(im_last, cax=cax)
+        cbar.set_label("Permeability K", fontsize=10)
+
+    if suptitle:
+        fig.suptitle(suptitle, fontsize=12, y=0.995)
+
+    # Spacing tuned for many rows
+    fig.subplots_adjust(left=0.05, right=0.90, top=0.97, bottom=0.05, wspace=0.25, hspace=0.35)
+
+    # Save a single page
+    with PdfPages(pdf_path) as pdf:
+        pdf.savefig(fig, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    return pdf_path
+
+import pandas as pd
+
+def fit_variogram_ensemble(
+    K_ens: np.ndarray,
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    data_scale: str = "log10",         # "log10" (recommended) or "lin"
+    model_cls: Type[gs.CovModel] = gs.Stable,
+    nugget: bool = False,
+    n_lags: int = 30,
+    max_lag: Optional[float] = None,   # default: 0.5 * domain diagonal
+    return_models: bool = False,
+    len_scale: float = 70,
+    angle: float = 0,
+) -> Tuple[pd.DataFrame, Optional[List[gs.CovModel]], Optional[Tuple[np.ndarray, np.ndarray]]]:
+    """
+    Fit an isotropic variogram model to each field in an ensemble.
+
+    Parameters
+    ----------
+    K_ens : ndarray
+        Shape (n_realizations, Ny, Nx). Permeability fields.
+    x, y : ndarray
+        1D coordinate arrays defining the structured grid axes.
+    data_scale : {"log10","lin"}
+        Work on log10(K) (recommended for your pipeline) or raw K.
+    model_cls : gstools covariance model class
+        e.g., gs.Stable (default), gs.Exponential, gs.Matern, ...
+    nugget : bool
+        Fit a nugget (True) or not (False).
+    n_lags : int
+        Number of lag bins for empirical variogram.
+    max_lag : float or None
+        Maximum lag to consider. If None, uses 0.5 * domain diagonal.
+    return_models : bool
+        If True, also return the list of fitted model instances and
+        the common (bin_center, ensemble_mean_gamma).
+
+    Returns
+    -------
+    df : pandas.DataFrame
+        One row per realization with fitted parameters:
+        ["realization", "var", "len_scale", "nugget", "alpha"] (where available).
+    models : list[gs.CovModel] or None
+        The fitted model objects (if return_models=True).
+    (bin_center, gamma_mean) : tuple or None
+        The common bin centers and the ensemble-mean empirical gamma
+        (if return_models=True).
+    """
+    if K_ens.ndim != 3:
+        raise ValueError("K_ens must have shape (n_realizations, Ny, Nx).")
+    n, Ny, Nx = K_ens.shape
+    if x.ndim != 1 or y.ndim != 1:
+        raise ValueError("x and y must be 1D arrays (structured grid axes).")
+    if Ny != y.size or Nx != x.size:
+        raise ValueError("K_ens.shape must match len(y), len(x).")
+
+    # Build one common set of lag bin edges (shared across ensemble)
+    Lx = float(x[-1] - x[0])
+    Ly = float(y[-1] - y[0])
+    domain_diag = np.hypot(Lx, Ly)
+    if max_lag is None:
+        max_lag = 0.5 * domain_diag
+    if len_scale is not None:
+        bin_edges, n_lags = auto_linear_bin_edges(x, y, max_lag=max_lag, len_scale=len_scale, q_per_len=8)
+    else:
+        bin_edges = np.linspace(0.0, max_lag, n_lags + 1)
+
+
+    # Pre-allocate containers
+    rows = []
+    models: List[gs.CovModel] = []
+    gamma_stack = []
+
+    # Coordinates for structured variogram estimation
+    # Use the structured estimator for performance/consistency.
+    pos_structured = [x, y]
+
+    for i in range(n):
+        K = K_ens[i]
+        field = np.log10(K) if data_scale.lower() == "log10" else K
+
+        bin_center, gamma = gs.vario_estimate(
+            (x, y), field, bin_edges=bin_edges, #angles_tol=np.pi / 16,
+        )
+
+        gamma_stack.append(gamma)
+
+        # Fit the chosen model class
+        fit_model = model_cls(dim=2, len_scale=len_scale)
+        fit_model.fit_variogram(bin_center, gamma, nugget=nugget)
+
+        # Collect parameters (only those that exist on the chosen model)
+        row = {
+            "realization": i,
+            "var": getattr(fit_model, "var", np.nan),
+            "len_scale": getattr(fit_model, "len_scale", np.nan),
+            "anis": float(getattr(fit_model, "anis", np.nan)),
+            "angle": float(getattr(fit_model, "angles", np.nan)),
+            "nugget": getattr(fit_model, "nugget", 0.0) if nugget else 0.0,
+        }
+        # Stable/Matern carry shape parameters; others may not.
+        row["alpha"] = getattr(fit_model, "alpha", np.nan)
+        row["nu"]    = getattr(fit_model, "nu",    np.nan)
+
+        rows.append(row)
+        if return_models:
+            models.append(fit_model)
+
+    df = pd.DataFrame(rows)
+    gamma_stack = np.vstack(gamma_stack)  # (n, n_lags)
+
+    if return_models:
+        gamma_mean = gamma_stack.mean(axis=0)
+        return df, models, (bin_center, gamma_mean)
+    return df, None, None
+
+def auto_linear_bin_edges(x, y, len_scale, max_lag=None, q_per_len=8,
+                          min_lags=15, max_lags=60):
+    """
+    Linear binning with n_lags ≈ q_per_len * (max_lag / len_scale),
+    clipped to [min_lags, max_lags].
+    """
+    Lx, Ly = float(x[-1]-x[0]), float(y[-1]-y[0])
+    if max_lag is None:
+        max_lag = 0.5 * np.hypot(Lx, Ly)
+    n_lags = int(np.clip(np.round(q_per_len * max_lag / len_scale),
+                         min_lags, max_lags))
+    edges = np.linspace(0.0, max_lag, n_lags + 1)
+    return edges, n_lags
+
+def plot_ensemble_variogram_summary(
+    bin_center: np.ndarray,
+    gamma_mean: np.ndarray,
+    df_params: pd.DataFrame,
+    model_cls: Type[gs.CovModel] = gs.Stable,
+    title: str = "Ensemble variogram: empirical mean vs. median-fit model",
+):
+    """
+    Plot ensemble-mean empirical variogram and the model fitted with
+    median parameters across realizations (robust representative).
+
+    Parameters
+    ----------
+    bin_center : ndarray
+        Common lag bin centers (from fit_variogram_ensemble return).
+    gamma_mean : ndarray
+        Ensemble-mean empirical semivariances.
+    df_params : DataFrame
+        Output from fit_variogram_ensemble (one row per realization).
+    model_cls : gstools covariance model class
+        Same type used in fitting.
+    title : str
+        Plot title.
+    """
+    # median parameters (robust against outliers)
+    var_med      = np.nanmedian(df_params["var"].values)
+    len_med      = np.nanmedian(df_params["len_scale"].values)
+    anis_med     = np.nanmedian(df_params["anis"].values)
+    angle_med    = np.nanmedian(df_params["angle"].values)
+    nugget_med   = np.nanmedian(df_params["nugget"].values)
+    alpha_med    = np.nanmedian(df_params["alpha"].values) if "alpha" in df_params else np.nan
+    nu_med       = np.nanmedian(df_params["nu"].values)    if "nu" in df_params else np.nan
+
+    # instantiate model with available parameters
+    kwargs = {"dim": 2, "var": var_med, "len_scale": len_med, "anis": anis_med, "angle": angle_med}
+    if not np.isnan(nugget_med):
+        kwargs["nugget"] = nugget_med
+    if not np.isnan(alpha_med) and hasattr(model_cls, "alpha"):
+        kwargs["alpha"] = float(alpha_med)
+    if not np.isnan(nu_med) and hasattr(model_cls, "nu"):
+        kwargs["nu"] = float(nu_med)
+
+    model = model_cls(**kwargs)
+
+    # model variogram curve on a dense lag grid for smoothness
+    h_dense = np.linspace(0, bin_center.max(), 400)
+    gamma_model = model.variogram(h_dense)
+
+    # plot
+    plt.figure(figsize=(6.5, 4.2))
+    plt.plot(bin_center, gamma_mean, "o", label="Empirical (ensemble mean)")
+    plt.plot(h_dense, gamma_model, "-", label=f"{model_cls.__name__} (median fit)")
+    plt.xlabel("Lag h")
+    plt.ylabel("Semivariance γ(h)")
+    plt.title(title)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.show()
+    plt.savefig()
 
 
 def main():
-    x = y = np.linspace(0, 128, 128)
+    x = y = np.linspace(0, 639, 640)
     scaling = 1e-3/(1000*9.81)
-    bounds = (1e-4*scaling, 1e-2*scaling)
+    bounds = (1e-4*scaling, 5e-2*scaling)
     mu10 = 0.5 * (np.log10(bounds[0]) + np.log10(bounds[1]))
-    sigma10 = 0.3
+    sigma10 = 0.4
+    len_scale = 70.0
 
     gen = TruncatedLog10LognormalFieldGenerator(
         bounds,
@@ -462,25 +649,59 @@ def main():
     )
 
     K_ens, seeds = gen.generate_ensemble(
-        x, y, n_realizations=100,
-        len_scale=40.0,
+        x, y, n_realizations=20,
+        len_scale=len_scale,
         anis=1.0,
         var_kernel=1.0,              # typically leave at 1.0 (standardize_latent=True)
         copula="gaussian",
-        master_seed=20170519,
+        master_seed=20251017,
         store_prefix=None,  # optional: SRF will store the latent Z draws
         return_latent=False,
     )
 
-    #plot_field_diagnostics(K_ens[0], gen, title=f"Realization 0 (seed={seeds[0]})")
-
-    out_paths = gen.save_ensemble_h5(
+    save_ensemble_diagnostics_single_page_pdf(
         K_ens,
-        seeds=seeds,
-        out_dir="/scratch/adelhetn/data/vampireman/permeability-input-fields",
-        filename_pattern="permeability_seed{seed}_{i:04}.h5",
-        dataset_name="Permeability"
+        generator=gen,
+        pdf_path="ensemble_diagnostics.pdf",
+        log_scale=True,
+        bins=50,
+        titles=None,          # or provide custom titles per realization
+        seeds=seeds,          # optional: shows seed in the left-panel title
+        suptitle="Permeability Ensemble — Spatial Maps and Histograms",
+        dpi=300,
     )
+
+    # Assume: x, y (1D axes), and K_ens with shape (n_realizations, Ny, Nx)
+    # Prefer log10(K) for variogram fitting in your pipeline:
+    df, models, (h, gamma_mean) = fit_variogram_ensemble(
+        K_ens, x, y,
+        data_scale="log10",
+        model_cls=gs.Exponential,   # or gs.Exponential, gs.Matern, ...
+        nugget=False,
+        n_lags=30,
+        max_lag=None,          # defaults to 0.5 * domain diagonal
+        return_models=True,
+        len_scale=len_scale
+    )
+
+    print(df.head(100))  # fitted parameters per realization
+
+    # Quick sanity plot: ensemble mean empirical vs. "median" fitted model
+    plot_ensemble_variogram_summary(
+        h, gamma_mean, df, model_cls=gs.Stable,
+        title="Log10(K) variogram — empirical mean vs. median Stable fit"
+    )
+
+    print("done")
+
+
+    # out_paths = gen.save_ensemble_h5(
+    #     K_ens,
+    #     seeds=seeds,
+    #     out_dir="/scratch/adelhetn/data/vampireman/permeability-input-fields",
+    #     filename_pattern="permeability_seed{seed}_{i:04}.h5",
+    #     dataset_name="Permeability"
+    # )
 
 if __name__ == "__main__":
     main()
